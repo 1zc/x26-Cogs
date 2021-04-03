@@ -132,6 +132,38 @@ class Sbansync(commands.Cog):
 
         await ctx.send(text)
 
+    @sbansync.command(name="syncall")
+    @commands.bot_has_permissions(ban_members=True)
+    async def sbansyncsyncall(self, ctx: commands.Context):
+        """Syncs all bans with all servers in push/pull lists
+        
+        Yes, this is the fucking help dialog, Infra. *- Infra, but from the past.*"""
+        author = ctx.author
+        b = self.bot
+
+        pull = await self.config.guild(ctx.guild).allow_pull_from()
+        push = await self.config.guild(ctx.guild).allow_push_to()
+
+        async with ctx.typing():
+            for server in pull:
+                await ctx.send(f":arrow_counterclockwise: Syncing with server: {b.get_guild(server).name} ({server})")
+                try:
+                    stats = await self.do_operation(Operation.Sync, author, b.get_guild(server))
+                except RuntimeError as e:
+                    return await ctx.send(str(e))
+                    
+                text = ""
+
+                if stats:
+                    for k, v in stats.items():
+                        text += f"{k} {v}\n"
+                else:
+                    text = f"No bans to sync with {server}"
+                    
+                await ctx.send(text)
+
+        await ctx.send(":white_check_mark: Global ban sync complete!")
+
     @commands.group()
     @commands.guild_only()
     @commands.admin()
