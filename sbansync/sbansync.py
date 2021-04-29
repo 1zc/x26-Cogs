@@ -25,7 +25,14 @@ from enum import Enum
 from collections import Counter
 import discord
 import logging
+import asyncio
 
+# red 3.0 backwards compatibility support
+listener = getattr(commands.Cog, "listener", None)
+
+if listener is None:  # thanks Sinbad
+    def listener(name=None):
+        return lambda x: x
 log = logging.getLogger("red.x26cogs.simplebansync")
 
 class Operation(Enum):
@@ -64,7 +71,7 @@ class Sbansync(commands.Cog):
 
         async with ctx.typing():
             try:
-                stats = await self.do_operation(Operation.Pull, author, server)
+                stats = await self.do_operation(Operation.Pull, author, server, f"Manual Ban Sync issued by {author} ({author.id})")
             except RuntimeError as e:
                 return await ctx.send(str(e))
 
@@ -91,7 +98,7 @@ class Sbansync(commands.Cog):
 
         async with ctx.typing():
             try:
-                stats = await self.do_operation(Operation.Push, author, server)
+                stats = await self.do_operation(Operation.Push, author, server, f"Manual Ban Sync issued by {author} ({author.id})")
             except RuntimeError as e:
                 return await ctx.send(str(e))
 
@@ -118,7 +125,7 @@ class Sbansync(commands.Cog):
 
         async with ctx.typing():
             try:
-                stats = await self.do_operation(Operation.Sync, author, server)
+                stats = await self.do_operation(Operation.Sync, author, server, f"Manual Ban Sync issued by {author} ({author.id})")
             except RuntimeError as e:
                 return await ctx.send(str(e))
 
@@ -132,6 +139,80 @@ class Sbansync(commands.Cog):
 
         await ctx.send(text)
 
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild, user):
+        Ban = await guild.fetch_ban(user)
+        Reason = f"{Ban.reason} <{guild.name}>"
+        b = self.bot
+        logChannel = b.get_channel(827821096828272660)
+
+        push = await self.config.guild(guild).allow_push_to()
+        for server in push:
+            await asyncio.sleep(3) # cool down
+            try:
+                if not b.get_guild(server).me.guild_permissions.ban_members:
+                    await logChannel.send(f"[BAN SYNC]: :stop_sign: **FATAL**: A ban on <@{user.id}> (`{user.id}`) has __FAILED__ to push from `{guild.name}` to `{b.get_guild(server).name}`. \n> Fatal Error: `NOT AUTHORIZED IN TARGET SERVER. PLEASE REVIEW BOT AUTHORIZATION IMMEDIATELY.`")
+                else:
+                    server_bans = [await b.get_guild(server).bans()]
+                    if user not in server_bans:
+                        await b.get_guild(server).ban(user, delete_message_days=0, reason=Reason)
+                        await logChannel.send(f"[BAN SYNC]: :white_check_mark: A ban on <@{user.id}> (`{user.id}`) has been pushed from `{guild.name}` to `{b.get_guild(server).name}`. \n> Details: `{Ban.reason}`")
+
+            except discord.HTTPException as E:
+                await logChannel.send(f"[BAN SYNC]: :warning: **ALERT**: A ban on <@{user.id}> (`{user.id}`) has __FAILED__ to push from `{guild.name}` to `{b.get_guild(server).name}`. \n> Exception: `{E.status}`")
+
+    @commands.Cog.listener()
+    async def on_member_unban(self, guild, user):
+        b = self.bot
+        logChannel = b.get_channel(827821096828272660)
+
+        push = await self.config.guild(guild).allow_push_to()
+
+        for server in push:
+            await asyncio.sleep(3) # cool down
+            try:
+                if not b.get_guild(server).me.guild_permissions.ban_members:
+                    await logChannel.send(f"[BAN SYNC]: :stop_sign: **FATAL**: An unban on <@{user.id}> (`{user.id}`) has __FAILED__ to push from `{guild.name}` to `{b.get_guild(server).name}`. \n> Fatal Error: `NOT AUTHORIZED IN TARGET SERVER. PLEASE REVIEW BOT AUTHORIZATION IMMEDIATELY.`")
+                else:
+                    await b.get_guild(server).unban(user, reason=f"Globally unbanned from <{guild.name}>")
+                    await logChannel.send(f"[BAN SYNC]: :white_check_mark: An unban on <@{user.id}> (`{user.id}`) has been pushed from `{guild.name}` to `{b.get_guild(server).name}`.")
+            
+            except discord.HTTPException as E:
+                await logChannel.send(f"[BAN SYNC]: :warning: **ALERT**: An unban on <@{user.id}> (`{user.id}`) has __FAILED__ to push from `{guild.name}` to `{b.get_guild(server).name}`. \n> Exception: `{E.status}`")
+
+    @sbansync.command(name="pushall")
+    @commands.bot_has_permissions(ban_members=True)
+    async def sbansyncpushall(self, ctx: commands.Context):
+        """Push bans to all servers in push list
+        
+        The command issuer must be an admin on that server OR the server
+        needs to whitelist this one for push operations"""
+        author = ctx.author
+        b = self.bot
+
+        push = await self.config.guild(ctx.guild).allow_push_to()
+
+        async with ctx.typing():
+            await ctx.send(f":warning: Commencing global ban push.")
+            for server in push:
+                await ctx.send(f":outbox_tray: Pushing new bans to server: {b.get_guild(server).name} ({server})")
+                try:
+                    stats = await self.do_operation(Operation.Push, author, b.get_guild(server), f"Manual Ban Sync issued by {author} ({author.id})")
+                except RuntimeError as e:
+                    return await ctx.send(str(e))
+                    
+                text = ""
+
+                if stats:
+                    for k, v in stats.items():
+                        text += f"{k} {v}\n"
+                else:
+                    text = f":ballot_box_with_check: No new bans to push to {b.get_guild(server).name} ({server})."
+                    
+                await ctx.send(text)
+
+        await ctx.send(":white_check_mark: Global ban push complete!")
+    
     @sbansync.command(name="syncall")
     @commands.bot_has_permissions(ban_members=True)
     async def sbansyncsyncall(self, ctx: commands.Context):
@@ -145,10 +226,12 @@ class Sbansync(commands.Cog):
         push = await self.config.guild(ctx.guild).allow_push_to()
 
         async with ctx.typing():
+            await ctx.send(f":warning: Commencing global sync.")
+            await ctx.send(f":warning: Pulling all global bans from servers...")
             for server in pull:
-                await ctx.send(f":arrow_counterclockwise: Syncing with server: {b.get_guild(server).name} ({server})")
+                await ctx.send(f":inbox_tray: Pulling new bans from server: {b.get_guild(server).name} ({server})")
                 try:
-                    stats = await self.do_operation(Operation.Sync, author, b.get_guild(server))
+                    stats = await self.do_operation(Operation.Pull, author, b.get_guild(server), f"Manual Ban Sync issued by {author} ({author.id})")
                 except RuntimeError as e:
                     return await ctx.send(str(e))
                     
@@ -158,7 +241,25 @@ class Sbansync(commands.Cog):
                     for k, v in stats.items():
                         text += f"{k} {v}\n"
                 else:
-                    text = f"No bans to sync with {server}"
+                    text = f":ballot_box_with_check: No new bans to pull from {b.get_guild(server).name} ({server})."
+                    
+                await ctx.send(text)
+
+            await ctx.send(f":warning: Pushing all global bans to servers...")
+            for server in push:
+                await ctx.send(f":outbox_tray: Pushing new bans to server: {b.get_guild(server).name} ({server})")
+                try:
+                    stats = await self.do_operation(Operation.Push, author, b.get_guild(server), f"Manual Ban Sync issued by {author} ({author.id})")
+                except RuntimeError as e:
+                    return await ctx.send(str(e))
+                    
+                text = ""
+
+                if stats:
+                    for k, v in stats.items():
+                        text += f"{k} {v}\n"
+                else:
+                    text = f":ballot_box_with_check: No new bans to push to {b.get_guild(server).name} ({server})."
                     
                 await ctx.send(text)
 
@@ -256,10 +357,10 @@ class Sbansync(commands.Cog):
         else:
             raise ValueError("Invalid operation")
 
-    async def do_operation(self, operation: Operation, member: discord.Member, target_guild: discord.Guild):
+    async def do_operation(self, operation: Operation, member: discord.Member, target_guild: discord.Guild, Reason):
         guild = member.guild
         if not target_guild.me.guild_permissions.ban_members:
-            raise RuntimeError("I do not have ban members permissions in the target server.")
+            raise RuntimeError(":stop_sign: I do not have ban members permissions in the target server.")
 
         stats = Counter()
 
@@ -270,21 +371,21 @@ class Sbansync(commands.Cog):
             for m in target_bans:
                 if m not in guild_bans:
                     try:
-                        await guild.ban(m, delete_message_days=0, reason=f"Syncban issued by {member} ({member.id})")
+                        await guild.ban(m, delete_message_days=0, reason=Reason)
                     except (discord.Forbidden, discord.HTTPException):
-                        stats["Failed pulls: "] += 1
+                        stats[":stop_sign: Failed pulls: "] += 1
                     else:
-                        stats["Pulled bans: "] += 1
+                        stats[":ballot_box_with_check: Pulled bans: "] += 1
 
         if operation in (Operation.Push, Operation.Sync):
             for m in guild_bans:
                 if m not in target_bans:
                     try:
-                        await target_guild.ban(m, delete_message_days=0, reason=f"Syncban issued by {member} ({member.id})")
+                        await target_guild.ban(m, delete_message_days=0, reason=Reason)
                     except (discord.Forbidden, discord.HTTPException):
-                        stats["Failed pushes: "] += 1
+                        stats[":stop_sign: Failed pushes: "] += 1
                     else:
-                        stats["Pushed bans: "] += 1
+                        stats[":ballot_box_with_check: Pushed bans: "] += 1
 
         return stats
 
